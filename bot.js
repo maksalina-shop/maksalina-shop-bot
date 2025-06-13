@@ -1,132 +1,137 @@
-const TelegramBot = require('node-telegram-bot-api');
-const { GoogleSpreadsheet } = require('google-spreadsheet');
-const express = require('express');
-require('dotenv').config();
-
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-const doc = new GoogleSpreadsheet(process.env.GOOGLE_SHEET_ID);
-
+const TelegramBot = require("node-telegram-bot-api");
+const { GoogleSpreadsheet } = require("google-spreadsheet");
+const express = require("express");
 const app = express();
-app.get('/', (_, res) => res.send('Бот работает!'));
-app.listen(process.env.PORT || 3000);
 
-let userStates = {};
-let userPhotos = {};
+const token = "8012750026:AAGQYD5LNdouGKHSoXChV7Qhx0BRheCQWds";
+const bot = new TelegramBot(token, { polling: true });
 
-// Авторизация к таблице
-async function accessSheet() {
+// Подключение к Google таблице
+const doc = new GoogleSpreadsheet("1VIey-N-LWWisbehPHWI3WxDqBsoxzWTkJIEJvVlbTK8");
+
+const serviceEmail = process.env.GOOGLE_SERVICE_EMAIL;
+const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n");
+
+const userState = {};
+
+async function loadSheet() {
   await doc.useServiceAccountAuth({
-    client_email: process.env.GOOGLE_SERVICE_EMAIL,
-    private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    client_email: serviceEmail,
+    private_key: privateKey,
   });
   await doc.loadInfo();
+  return doc.sheetsByIndex[0];
 }
 
-// Получить уникальные категории и подкатегории
-async function getOptions(type, category = null) {
-  await accessSheet();
-  const sheet = doc.sheetsByIndex[0];
-  const rows = await sheet.getRows();
-
-  const categories = new Set();
-  const subcategories = new Set();
-
-  for (const row of rows) {
-    if (row['категория']) categories.add(row['категория']);
-    if (category && row['категория'] === category && row['подкатегория']) {
-      subcategories.add(row['подкатегория']);
-    }
-  }
-
-  return type === 'категория'
-    ? Array.from(categories)
-    : Array.from(subcategories);
+function resetUser(chatId) {
+  userState[chatId] = {
+    step: "start",
+    photo: null,
+    category: null,
+    subcategory: null,
+    name: null,
+    description: null,
+    price: null,
+  };
 }
 
-bot.on('photo', async (msg) => {
+bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
-  const photo = msg.photo[msg.photo.length - 1].file_id;
-  userPhotos[chatId] = [photo];
-  userStates[chatId] = { step: 'категория' };
-
-  const categories = await getOptions('категория');
-  const buttons = categories.map((c) => [{ text: c }]);
-
-  bot.sendMessage(chatId, 'Выбери категорию:', {
-    reply_markup: { keyboard: buttons, one_time_keyboard: true },
-  });
-});
-
-bot.on('message', async (msg) => {
-  const chatId = msg.chat.id;
-  const state = userStates[chatId];
-
-  if (!state || msg.text.startsWith('/')) return;
-
   const text = msg.text;
+  const state = userState[chatId] || { step: "start" };
 
-  if (state.step === 'категория') {
-    state.category = text;
-    state.step = 'подкатегория';
+  if (msg.photo) {
+    resetUser(chatId);
+    userState[chatId].photo = msg.photo[msg.photo.length - 1].file_id;
 
-    const subcategories = await getOptions('подкатегория', text);
-    const buttons = subcategories.map((s) => [{ text: s }]);
+    const sheet = await loadSheet();
+    await sheet.loadHeaderRow();
+    const rows = await sheet.getRows();
+    const uniqueCategories = [...new Set(rows.map(row => row["категория"]))];
 
-    bot.sendMessage(chatId, 'Теперь выбери подкатегорию:', {
-      reply_markup: { keyboard: buttons, one_time_keyboard: true },
-    });
-
-  } else if (state.step === 'подкатегория') {
-    state.subcategory = text;
-    state.step = 'название';
-    bot.sendMessage(chatId, 'Введите название товара:');
-
-  } else if (state.step === 'название') {
-    state.title = text;
-    state.step = 'описание';
-    bot.sendMessage(chatId, 'Введите описание товара (или "-" если нет):');
-
-  } else if (state.step === 'описание') {
-    state.description = text === '-' ? '' : text;
-    state.step = 'цена';
-    bot.sendMessage(chatId, 'Введите цену товара:');
-
-  } else if (state.step === 'цена') {
-    state.price = text;
-    state.step = 'подтверждение';
-
-    const photoId = userPhotos[chatId][0];
-    bot.sendPhoto(chatId, photoId, {
-      caption: `❗️Проверь:\n\n📦 *${state.title}*\n🧾 ${state.description}\n💰 ${state.price} ₽\n📁 ${state.category} > ${state.subcategory}`,
-      parse_mode: 'Markdown',
+    userState[chatId].step = "category";
+    bot.sendMessage(chatId, "Выберите категорию:", {
       reply_markup: {
-        keyboard: [[{ text: '✅ Добавить' }, { text: '❌ Отменить' }]],
+        keyboard: uniqueCategories.map(c => [c]),
+        resize_keyboard: true,
         one_time_keyboard: true,
       },
     });
-
-  } else if (state.step === 'подтверждение') {
-    if (text === '✅ Добавить') {
-      await accessSheet();
-      const sheet = doc.sheetsByIndex[0];
-      const photo = await bot.getFile(userPhotos[chatId][0]);
-      const photoUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${photo.file_path}`;
-
-      await sheet.addRow({
-        'категория': state.category,
-        'подкатегория': state.subcategory,
-        'название': state.title,
-        'описание': state.description,
-        'цена': state.price,
-        'ссылка на фото': photoUrl,
-      });
-
-      bot.sendMessage(chatId, '✅ Товар добавлен в таблицу!');
-    } else {
-      bot.sendMessage(chatId, '❌ Добавление отменено.');
-    }
-
-    delete userStates[chatId];
-    delete userPhotos[chatId];
+    return;
   }
+
+  if (state.step === "category") {
+    userState[chatId].category = text;
+
+    const sheet = await loadSheet();
+    const rows = await sheet.getRows();
+    const subcategories = [...new Set(
+      rows
+        .filter(r => r["категория"] === text)
+        .map(r => r["подкатегория"])
+    )];
+
+    userState[chatId].step = "subcategory";
+    bot.sendMessage(chatId, "Выберите подкатегорию:", {
+      reply_markup: {
+        keyboard: subcategories.map(s => [s]),
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    });
+    return;
+  }
+
+  if (state.step === "subcategory") {
+    userState[chatId].subcategory = text;
+    userState[chatId].step = "name";
+    bot.sendMessage(chatId, "Введите название товара:");
+    return;
+  }
+
+  if (state.step === "name") {
+    userState[chatId].name = text;
+    userState[chatId].step = "description";
+    bot.sendMessage(chatId, "Введите описание товара:");
+    return;
+  }
+
+  if (state.step === "description") {
+    userState[chatId].description = text;
+    userState[chatId].step = "price";
+    bot.sendMessage(chatId, "Введите цену товара:");
+    return;
+  }
+
+  if (state.step === "price") {
+    userState[chatId].price = text;
+
+    const sheet = await loadSheet();
+    await sheet.addRow({
+      "категория": userState[chatId].category,
+      "подкатегория": userState[chatId].subcategory,
+      "название": userState[chatId].name,
+      "описание": userState[chatId].description,
+      "цена": userState[chatId].price,
+      "ссылка на фото": `https://api.telegram.org/file/bot${token}/${await getFilePath(userState[chatId].photo)}`
+    });
+
+    bot.sendMessage(chatId, "✅ Товар добавлен в таблицу!");
+    resetUser(chatId);
+  }
+});
+
+// Получить прямую ссылку на фото
+async function getFilePath(fileId) {
+  const file = await bot.getFile(fileId);
+  return file.file_path;
+}
+
+// Express-сервер для Render
+app.get("/", (req, res) => {
+  res.send("Бот работает!");
+});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Сервер запущен на порту ${PORT}`);
 });
